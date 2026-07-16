@@ -1,0 +1,244 @@
+#include <Arduino.h>
+#include <FlexCAN_T4.h>
+#include <math.h>
+
+// -------------------------------------------------------------
+// 1. 모터 및 통신 설정 파라미터
+// -------------------------------------------------------------
+const uint8_t ACT_ID = 127;       // 모터 CAN ID
+const uint8_t HOST_ID = 253;    // Teensy(호스트) ID
+
+// Teensy 4.0/4.1의 CAN1 핀을 사용하면 Can0 인스턴스를 사용합니다.
+FlexCAN_T4<CAN1, RX_SIZE_256, TX_SIZE_16> Can0;
+
+// -------------------------------------------------------------
+// 2. Robstride 프로토콜 물리적 제한 한계값 (데이터 정수화용)
+// -------------------------------------------------------------
+const float P_MIN = -12.5f;
+const float P_MAX = 12.5f;
+const float V_MIN = -45.0f;
+const float V_MAX = 45.0f;
+const float KP_MAX = 500.0f;
+const float KD_MAX = 5.0f;
+const float T_MIN = -18.0f;
+const float T_MAX = 18.0f;
+
+// -------------------------------------------------------------
+// 3. 제어 주기 및 타겟 프로파일 (50 Hz / dt = 0.02초)
+// -------------------------------------------------------------
+const float OPEN_POS = 6.15f;
+const float CLOSE_POS = 7.6f;
+const float CENTER = (OPEN_POS + CLOSE_POS) / 2.0f;
+const float AMPLITUDE = (CLOSE_POS - OPEN_POS) / 2.0f;
+const float FREQ = 0.2f; 
+
+const uint32_t CONTROL_PERIOD_US = 20000; // dt = 0.02s -> 20,000us
+elapsedMicros controlTimer;
+
+float t_start = 0.0f;
+
+// -------------------------------------------------------------
+// 4. 데이터 스케일링 및 가상 시리얼 변환 헬퍼 함수
+// -------------------------------------------------------------
+uint16_t floatToUint(float x, float x_min, float x_max, uint8_t bits) {
+  if (x < x_min) x = x_min;
+  if (x > x_max) x = x_max;
+  return (uint16_t)((x - x_min) / (x_max - x_min) * ((1u << bits) - 1));
+}
+
+float uintToFloat(uint16_t x, float x_min, float x_max) {
+  return x_min + (float)x * (x_max - x_min) / 65535.0f;
+}
+
+// CAN 메시지를 파이썬 시리얼 패킷 형태(17바이트 16진수)로 변환하여 출력하는 함수
+void printAsSerialPacket(const CAN_message_t &msg, const char* prefix) {
+  uint32_t header_shifted = (msg.id << 3) | 4;
+  
+  uint8_t h0 = (header_shifted >> 24) & 0xFF;
+  uint8_t h1 = (header_shifted >> 16) & 0xFF;
+  uint8_t h2 = (header_shifted >> 8) & 0xFF;
+  uint8_t h3 = header_shifted & 0xFF;
+
+  Serial.printf("[%s] 41 54 %02X %02X %02X %02X 08 %02X %02X %02X %02X %02X %02X %02X %02X 0D 0A\r\n",
+                prefix, h0, h1, h2, h3,
+                msg.buf[0], msg.buf[1], msg.buf[2], msg.buf[3],
+                msg.buf[4], msg.buf[5], msg.buf[6], msg.buf[7]);
+}
+
+// -------------------------------------------------------------
+// 5. Robstride CAN 송신 제어 함수군
+// -------------------------------------------------------------
+
+// 모터 활성화 (Type3Message 매칭)
+void enableMotor() {
+  // 1. 먼저 구동 모드(Run Mode, 레지스터 0x7005)를 '운전 제어 모드(0)'로 강제 세팅합니다.
+  CAN_message_t mode_msg;
+  mode_msg.flags.extended = 1;
+  mode_msg.id = (0x12 << 24) | (HOST_ID << 8) | ACT_ID; // Type 18 Write Parameter
+  mode_msg.len = 8;
+  
+  // 레지스터 주소 0x7005 -> Big-endian 스왑 적용하여 배치
+  mode_msg.buf[0] = 0x05; 
+  mode_msg.buf[1] = 0x70; 
+  mode_msg.buf[2] = 0x00;
+  mode_msg.buf[3] = 0x00;
+  
+  // 설정값: 0 (Control Mode / MIT)
+  mode_msg.buf[4] = 0x00; 
+  mode_msg.buf[5] = 0x00;
+  mode_msg.buf[6] = 0x00;
+  mode_msg.buf[7] = 0x00;
+  
+  Can0.write(mode_msg);
+  printAsSerialPacket(mode_msg, "TX_SET_MODE");
+
+  // 모터 내부 프로세서가 모드 전환 연산을 처리할 시간을 아주 잠깐(50ms) 줍니다.
+  delay(50); 
+
+  // 2. 이제 세팅이 끝났으므로, 모터 전원을 켭니다 (Mode 3 Enable)
+  CAN_message_t enable_msg;
+  enable_msg.flags.extended = 1;
+  enable_msg.id = (3 << 24) | (HOST_ID << 8) | ACT_ID; // Mode 3 Enable
+  enable_msg.len = 8;
+  for (int i = 0; i < 8; i++) enable_msg.buf[i] = 0;
+  
+  Can0.write(enable_msg);
+  printAsSerialPacket(enable_msg, "TX_ENABLE");
+
+  Serial.println("[Teensy] Motor Mode 0 Initialized & Enabled successfully!");
+}
+
+// 모터 비활성화 (Type4Message 매칭)
+void disableMotor() {
+  CAN_message_t msg;
+  msg.flags.extended = 1;
+  msg.id = (4 << 24) | (HOST_ID << 8) | ACT_ID;
+  msg.len = 8;
+  for (int i = 0; i < 8; i++) msg.buf[i] = 0;
+  
+  Can0.write(msg);
+  printAsSerialPacket(msg, "TX_DISABLE");
+}
+
+// 실시간 운전 제어 (Type1Message / operation_control 매칭)
+void operationControl(float feed_forward, float pos, float vel, float kp, float kd) {
+  uint16_t p_int  = floatToUint(pos,          P_MIN, P_MAX,  16);
+  uint16_t v_int  = floatToUint(vel,          V_MIN, V_MAX,  16);
+  uint16_t kp_int = floatToUint(kp,           0.0f,  KP_MAX, 16);
+  uint16_t kd_int = floatToUint(kd,           0.0f,  KD_MAX, 16);
+  uint16_t t_int  = floatToUint(feed_forward, T_MIN, T_MAX,  16);
+
+  CAN_message_t msg;
+  msg.flags.extended = 1;
+  
+  msg.id = (1 << 24) | (t_int << 8) | ACT_ID;
+  msg.len = 8;
+  
+  msg.buf[0] = (p_int >> 8) & 0xFF;
+  msg.buf[1] = p_int & 0xFF;
+  msg.buf[2] = (v_int >> 8) & 0xFF;
+  msg.buf[3] = v_int & 0xFF;
+  msg.buf[4] = (kp_int >> 8) & 0xFF;
+  msg.buf[5] = kp_int & 0xFF;
+  msg.buf[6] = (kd_int >> 8) & 0xFF;
+  msg.buf[7] = kd_int & 0xFF;
+
+  Can0.write(msg);
+
+  // -------------------------------------------------------------
+  // 🔥 0.5초마다 물리 제어값과 인코딩된 헥사 패킷을 세트로 출력
+  // -------------------------------------------------------------
+  static uint32_t lastPrint = 0;
+  if (millis() - lastPrint >= 500) {
+    lastPrint = millis();
+    
+    // 1. 사람이 읽기 편한 실제 Target 값들 출력
+    Serial.printf("[TX_TARGET] Pos: %.3f rad, Vel: %.2f rad/s, Kp: %.1f, Kd: %.1f, T_ff: %.2f\r\n", 
+                  pos, vel, kp, kd, feed_forward);
+    
+    // 2. 위 데이터가 뼈대로 포장된 실제 17바이트 가상 시리얼 패킷 출력
+    printAsSerialPacket(msg, "TX_HEX_STR");
+    
+    // 가독성을 위해 한 세트가 끝날 때마다 빈 줄 추가
+    Serial.println(); 
+  }
+}
+
+// -------------------------------------------------------------
+// 6. CAN 수신 인터럽트 콜백 (모터 피드백 파싱)
+// -------------------------------------------------------------
+void rxCallback(const CAN_message_t &msg) {
+  uint8_t mode = (msg.id >> 24) & 0x1F;
+  
+  if (mode == 2) {
+    uint16_t p_raw = (msg.buf[0] << 8) | msg.buf[1];
+    uint16_t v_raw = (msg.buf[2] << 8) | msg.buf[3];
+    uint16_t t_raw = (msg.buf[4] << 8) | msg.buf[5];
+    
+    float current_pos = uintToFloat(p_raw, P_MIN, P_MAX);
+    float current_vel = uintToFloat(v_raw, V_MIN, V_MAX);
+    float current_trq = uintToFloat(t_raw, T_MIN, T_MAX);
+    
+    // Serial.printf("Feedback -> Pos: %.3f rad, Vel: %.2f rad/s, Trq: %.2f Nm\r\n", 
+    //               current_pos, current_vel, current_trq);
+  }
+}
+
+// -------------------------------------------------------------
+// 7. 메인 루프 구조
+// -------------------------------------------------------------
+void setup() {
+  Serial.begin(115200);
+  while (!Serial && millis() < 3000); 
+
+  Serial.println("=== Robstride 1:1 CAN Loop Test (Dual Dynamic Debug) ===");
+
+  Can0.begin();
+  Can0.setBaudRate(1000000); // 1 Mbps
+  Can0.setMaxMB(64);
+  Can0.setMBFilter(ACCEPT_ALL);
+  Can0.distribute();
+  Can0.enableMBInterrupts();
+  Can0.onReceive(rxCallback);
+
+  Serial.println("Teensy CAN initialized.");
+  delay(1000);
+
+
+  // enableMotor();
+
+  
+  t_start = (float)micros() * 1e-6f;
+  controlTimer = 0;
+}
+
+void loop() {
+  Can0.events(); 
+
+  // 20ms 주기 제어 루프 (50Hz)
+  if (controlTimer >= CONTROL_PERIOD_US) {
+    controlTimer -= CONTROL_PERIOD_US;
+
+    float t = ((float)micros() * 1e-6f) - t_start;
+
+    float target_pos = CENTER + AMPLITUDE * cosf(2.0f * M_PI * FREQ * t + M_PI);
+    float target_vel = 0.0f; 
+    float feed_forward_torque = 0.0f;
+    
+    float kp = 10.0f; 
+    float kd = 1.0f;  
+
+    operationControl(feed_forward_torque, target_pos, target_vel, kp, kd);
+  }
+}
+
+void serialEvent() {
+  if (Serial.available()) {
+    char ch = Serial.read();
+    if (ch == 'd' || ch == 'D') {
+      disableMotor();
+    } else if (ch == 'e' || ch == 'E') {
+      enableMotor();
+    }
+  }
+}
