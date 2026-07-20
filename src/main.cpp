@@ -6,10 +6,11 @@
 using namespace qindesign::network;
 
 // -------------------------------------------------------------
-// 1. 테스트할 모터 ID 및 호스트 설정
+// 1. 테스트할 모터 ID 배열 및 호스트 설정
 // -------------------------------------------------------------
-const uint8_t TEST_MOTOR_ID = 1;  // <-- 테스트할 모터의 실제 CAN ID로 수정하세요.
-const uint8_t HOST_ID = 253;      // Teensy 호스트 ID
+const uint8_t NUM_MOTORS = 2;
+const uint8_t TEST_MOTOR_IDS[NUM_MOTORS] = {1, 11};  // 1번과 11번 모터 ID 설정
+const uint8_t HOST_ID = 253;                         // Teensy 호스트 ID
 
 FlexCAN_T4<CAN1, RX_SIZE_256, TX_SIZE_16> Can0;
 
@@ -34,9 +35,9 @@ const uint32_t CONTROL_PERIOD_US = 20000; // 50Hz (20ms)
 elapsedMicros controlTimer;
 
 // -------------------------------------------------------------
-// 4. 단일 모터 입력 버퍼 설정
+// 4. 모터별 입력 버퍼 설정 (배열 구조)
 // -------------------------------------------------------------
-float ext_target_pos = 0.0f; // 단일 모터 목표 각도 (Radian)
+float ext_target_pos[NUM_MOTORS] = {0.0f, 0.0f}; // [0]: 1번 모터, [1]: 11번 모터 목표 각도
 bool ext_control_active = false;
 uint32_t last_packet_time = 0;
 const uint32_t WATCHDOG_TIMEOUT_MS = 500; // 0.5초 대기
@@ -66,7 +67,7 @@ void enableMotor(uint8_t motor_id) {
   enable_msg.len = 8;
   for (int i = 0; i < 8; i++) enable_msg.buf[i] = 0;
   Can0.write(enable_msg);
-  Serial.printf("[Teensy] Motor ID %d Enabled.\r\r\n", motor_id);
+  Serial.printf("[Teensy] Motor ID %d Enabled.\r\n", motor_id);
 }
 
 void disableMotor(uint8_t motor_id) {
@@ -76,7 +77,7 @@ void disableMotor(uint8_t motor_id) {
   msg.len = 8;
   for (int i = 0; i < 8; i++) msg.buf[i] = 0;
   Can0.write(msg);
-  Serial.printf("[Teensy] Motor ID %d Disabled.\r\r\n", motor_id);
+  Serial.printf("[Teensy] Motor ID %d Disabled.\r\n", motor_id);
 }
 
 void operationControl(uint8_t motor_id, float feed_forward, float pos, float vel, float kp, float kd) {
@@ -114,8 +115,8 @@ void setup() {
 
   IPAddress ip = Ethernet.localIP();
   Serial.println("==================================================");
-  Serial.println("[Teensy 4.1] Single Motor Test Mode (Ethernet-CAN)");
-  Serial.printf("Target Motor ID : %d\r\n", TEST_MOTOR_ID);
+  Serial.println("[Teensy 4.1] Dual Motor Test Mode (Ethernet-CAN)");
+  Serial.printf("Target Motors   : ID %d, ID %d\r\n", TEST_MOTOR_IDS[0], TEST_MOTOR_IDS[1]);
   Serial.printf("Static IP       : %d.%d.%d.%d\r\n", ip[0], ip[1], ip[2], ip[3]);
   Serial.printf("UDP Port        : %d\r\n", UDP_PORT);
   Serial.println("==================================================");
@@ -134,15 +135,19 @@ void loop() {
     if (len > 0) {
       packetBuffer[len] = '\0';
       
-      // 포맷 파싱: P,값 (예: P,0.2)
+      // 포맷 파싱: P,값1,값2 (예: P,0.2,-0.1)
       if (packetBuffer[0] == 'P') {
         char* token = strtok(packetBuffer, ",");
-        token = strtok(NULL, ","); // 'P' 다음의 첫 번째 데이터 추출
-        if (token != NULL) {
-          ext_target_pos = atof(token);
-          ext_control_active = true;
-          last_packet_time = millis(); // 왓치독 리셋
+        int i = 0;
+        while (token != NULL && i < NUM_MOTORS) {
+          token = strtok(NULL, ","); // 다음 데이터 추출
+          if (token != NULL) {
+            ext_target_pos[i] = atof(token);
+            i++;
+          }
         }
+        ext_control_active = true;
+        last_packet_time = millis(); // 왓치독 리셋
       }
     }
   }
@@ -155,31 +160,40 @@ void loop() {
       
       float target_vel = 0.0f;
       float feed_forward_torque = 0.0f;
-      float kp = 15.0f; // 테스트용 안전한 낮은 게인 값
+      float kp = 15.0f; 
       float kd = 1.0f;
 
-      // 싱글 모터 제어 명령 전송 (테스트 단계이므로 캘리브레이션 오프셋 없이 순수 입력값 전송)
-      operationControl(TEST_MOTOR_ID, feed_forward_torque, ext_target_pos, target_vel, kp, kd);
+      // 두 개의 모터에 각각 명령 순차 전송
+      for (int i = 0; i < NUM_MOTORS; i++) {
+        operationControl(TEST_MOTOR_IDS[i], feed_forward_torque, ext_target_pos[i], target_vel, kp, kd);
+      }
 
     } else {
       // 왓치독 타임아웃 처리
       if (ext_control_active) {
-        Serial.println("[EMERGENCY] UDP Timeout! Disabling test motor.");
+        Serial.println("[EMERGENCY] UDP Timeout! Disabling all test motors.");
         ext_control_active = false;
-        disableMotor(TEST_MOTOR_ID);
+        for (int i = 0; i < NUM_MOTORS; i++) {
+          disableMotor(TEST_MOTOR_IDS[i]);
+        }
       }
     }
   }
 }
 
-// 시리얼 명령 수동 제어 (E: 켜기, D: 끄기)
+// 시리얼 명령 수동 제어 (E: 전체 켜기, D: 전체 끄기)
 void serialEvent() {
   if (Serial.available()) {
     char ch = Serial.read();
     if (ch == 'd' || ch == 'D') {
-      disableMotor(TEST_MOTOR_ID);
+      for (int i = 0; i < NUM_MOTORS; i++) {
+        disableMotor(TEST_MOTOR_IDS[i]);
+      }
     } else if (ch == 'e' || ch == 'E') {
-      enableMotor(TEST_MOTOR_ID);
+      for (int i = 0; i < NUM_MOTORS; i++) {
+        enableMotor(TEST_MOTOR_IDS[i]);
+        delay(20); // CAN 버스 연속 명령 안정성을 위한 미세 딜레이
+      }
     }
   }
 }
