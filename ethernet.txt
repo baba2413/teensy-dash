@@ -1,0 +1,229 @@
+#include <Arduino.h>
+#include <QNEthernet.h> 
+#include <FlexCAN_T4.h>
+#include <math.h>
+
+// QNEthernet 공식 네임스페이스 지정
+using namespace qindesign::network;
+
+// -------------------------------------------------------------
+// 1. 하드웨어 및 CAN ID 설정
+// -------------------------------------------------------------
+const uint8_t JOINT_CAN_IDS[6] = {1, 2, 3, 4, 5, 6}; // 1~6번 관절 모터 CAN ID
+const uint8_t GRIPPER_CAN_ID = 127;                  // 그리퍼 모터 CAN ID
+const uint8_t HOST_ID = 253;                         // Teensy 호스트 ID
+
+// Teensy 4.1의 CAN1 포트 인스턴스 생성
+FlexCAN_T4<CAN1, RX_SIZE_256, TX_SIZE_16> Can0;
+
+// -------------------------------------------------------------
+// 2. Robstride 프로토콜 물리적 제한 한계값 (MIT 모드 패킹용)
+// -------------------------------------------------------------
+const float P_MIN = -12.5f;   const float P_MAX = 12.5f;
+const float V_MIN = -45.0f;   const float V_MAX = 45.0f;
+const float KP_MAX = 500.0f;  const float KD_MAX = 5.0f;
+const float T_MIN = -18.0f;   const float T_MAX = 18.0f;
+
+// -------------------------------------------------------------
+// 3. 네트워크 및 UDP 제어 주기 설정
+// -------------------------------------------------------------
+const uint16_t UDP_PORT = 5005; 
+EthernetUDP udp;
+
+IPAddress staticIP(192, 168, 1, 110); // Teensy 고정 IP
+IPAddress subnet(255, 255, 255, 0);
+
+const uint32_t CONTROL_PERIOD_US = 20000; // 50Hz (20ms)
+elapsedMicros controlTimer;
+
+// -------------------------------------------------------------
+// 4. 캘리브레이션 및 외부 입력 버퍼 설정
+// -------------------------------------------------------------
+struct JointCalibration {
+  float sign;   // 회전 방향 방향성 (1.0f 또는 -1.0f)
+  float offset; // 시뮬레이션 기준 0 rad일 때 실제 모터가 가리키는 엔코더 값 (rad)
+};
+
+// [중요] 실제 로봇 정렬 상태에 따라 이 테이블을 수정하십시오.
+JointCalibration calib[6] = {
+  { 1.0f,  0.0f },    // Joint 0 (shoulder_yaw)
+  { 1.0f, -1.0472f }, // Joint 1 (shoulder_pitch)
+  { 1.0f,  0.0f },    // Joint 2 (shoulder_roll)
+  { 1.0f,  2.0944f }, // Joint 3 (elbow_pitch)
+  { 1.0f,  0.0f },    // Joint 4 (lower_arm_roll)
+  { 1.0f, -1.0472f }  // Joint 5 (wrist_pitch)
+};
+
+// Isaac Lab으로부터 수신받을 목표 각도 저장 배열 (6개 관절 + 1개 그리퍼)
+float ext_target_pos[7] = {0.0f};
+bool ext_control_active = false;
+uint32_t last_packet_time = 0;
+const uint32_t WATCHDOG_TIMEOUT_MS = 500; // 0.5초간 패킷 미수신 시 안전 정지
+
+// -------------------------------------------------------------
+// 5. 데이터 정수화 및 모터 제어 명령 함수군
+// -------------------------------------------------------------
+uint16_t floatToUint(float x, float x_min, float x_max, uint8_t bits) {
+  if (x < x_min) x = x_min;
+  if (x > x_max) x = x_max;
+  return (uint16_t)((x - x_min) / (x_max - x_min) * ((1u << bits) - 1));
+}
+
+void enableMotor(uint8_t motor_id) {
+  CAN_message_t mode_msg;
+  mode_msg.flags.extended = 1;
+  mode_msg.id = (0x12 << 24) | (HOST_ID << 8) | motor_id;
+  mode_msg.len = 8;
+  mode_msg.buf[0] = 0x05; mode_msg.buf[1] = 0x70; // Run Mode 주소 (0x7005)
+  mode_msg.buf[4] = 0x00; // MIT 운전 제어 모드 (0)
+  Can0.write(mode_msg);
+  delay(50); 
+
+  CAN_message_t enable_msg;
+  enable_msg.flags.extended = 1;
+  enable_msg.id = (3 << 24) | (HOST_ID << 8) | motor_id;
+  enable_msg.len = 8;
+  for (int i = 0; i < 8; i++) enable_msg.buf[i] = 0;
+  Can0.write(enable_msg);
+  Serial.printf("[Teensy] Motor ID %d Enabled.\r\n", motor_id);
+}
+
+void disableMotor(uint8_t motor_id) {
+  CAN_message_t msg;
+  msg.flags.extended = 1;
+  msg.id = (4 << 24) | (HOST_ID << 8) | motor_id;
+  msg.len = 8;
+  for (int i = 0; i < 8; i++) msg.buf[i] = 0;
+  Can0.write(msg);
+  Serial.printf("[Teensy] Motor ID %d Disabled.\r\n", motor_id);
+}
+
+void operationControl(uint8_t motor_id, float feed_forward, float pos, float vel, float kp, float kd) {
+  uint16_t p_int  = floatToUint(pos,          P_MIN, P_MAX,  16);
+  uint16_t v_int  = floatToUint(vel,          V_MIN, V_MAX,  16);
+  uint16_t kp_int = floatToUint(kp,           0.0f,  KP_MAX, 16);
+  uint16_t kd_int = floatToUint(kd,           0.0f,  KD_MAX, 16);
+  uint16_t t_int  = floatToUint(feed_forward, T_MIN, T_MAX,  16);
+
+  CAN_message_t msg;
+  msg.flags.extended = 1;
+  msg.id = (1 << 24) | (t_int << 8) | motor_id;
+  msg.len = 8;
+  msg.buf[0] = (p_int >> 8) & 0xFF;  msg.buf[1] = p_int & 0xFF;
+  msg.buf[2] = (v_int >> 8) & 0xFF;  msg.buf[3] = v_int & 0xFF;
+  msg.buf[4] = (kp_int >> 8) & 0xFF; msg.buf[5] = kp_int & 0xFF;
+  msg.buf[6] = (kd_int >> 8) & 0xFF; msg.buf[7] = kd_int & 0xFF;
+  Can0.write(msg);
+}
+
+// -------------------------------------------------------------
+// 6. 메인 아두이노 루프 설계
+// -------------------------------------------------------------
+void setup() {
+  Serial.begin(115200);
+  
+  // CAN 버스 통신 초기화
+  Can0.begin();
+  Can0.setBaudRate(1000000); // 1 Mbps
+  Can0.setMaxMB(64);
+  Can0.setMBFilter(ACCEPT_ALL);
+  Can0.distribute();
+
+  // 이더넷 하드웨어 및 고정 IP, UDP 포트 초기화
+  Ethernet.begin(staticIP, subnet, IPAddress(0, 0, 0, 0)); 
+  udp.begin(UDP_PORT);
+
+  // [수정 완료] 지어낸 toString() 함수를 완벽히 제거하고 배열 인덱싱 구조로 출력 변경
+  IPAddress ip = Ethernet.localIP();
+  Serial.println("==================================================");
+  Serial.println("[Teensy 4.1] Production-Ready Ethernet-CAN Bridge");
+  Serial.printf("Static IP  : %d.%d.%d.%d\n", ip[0], ip[1], ip[2], ip[3]);
+  Serial.printf("UDP Port   : %d\n", UDP_PORT);
+  Serial.println("==================================================");
+  
+  controlTimer = 0;
+}
+
+void loop() {
+  Can0.events();
+
+  // UDP 네트워크 소켓 비동기 처리
+  int packetSize = udp.parsePacket();
+  if (packetSize > 0) {
+    char packetBuffer[128];
+    int len = udp.read(packetBuffer, sizeof(packetBuffer) - 1);
+    if (len > 0) {
+      packetBuffer[len] = '\0';
+      
+      // 고속 ASCII 스트링 데이터 파싱 (포맷: P,j0,j1,j2,j3,j4,j5,g)
+      if (packetBuffer[0] == 'P') {
+        char* token = strtok(packetBuffer, ",");
+        int i = 0;
+        while (token != NULL && i < 7) {
+          token = strtok(NULL, ",");
+          if (token != NULL) {
+            ext_target_pos[i] = atof(token);
+            i++;
+          }
+        }
+        ext_control_active = true;
+        last_packet_time = millis(); // 왓치독 타이머 리셋
+      }
+    }
+  }
+
+  // Real-time 20ms 하드웨어 제어 루프 실행 (50Hz)
+  if (controlTimer >= CONTROL_PERIOD_US) {
+    controlTimer -= CONTROL_PERIOD_US;
+
+    // 안전 확인: 통신이 유효하고 제한 시간 이내에 패킷이 수신되었을 때만 모터 구동
+    if (ext_control_active && (millis() - last_packet_time < WATCHDOG_TIMEOUT_MS)) {
+      
+      float target_vel = 0.0f;
+      float feed_forward_torque = 0.0f;
+      float kp = 15.0f; 
+      float kd = 1.0f;
+
+      // 1. 6개 관절 모터에 캘리브레이션 맵 연산 적용 후 CAN 전송
+      for (int i = 0; i < 6; i++) {
+        float calibrated_pos = (ext_target_pos[i] * calib[i].sign) + calib[i].offset;
+        operationControl(JOINT_CAN_IDS[i], feed_forward_torque, calibrated_pos, target_vel, kp, kd);
+      }
+
+      // 2. 그리퍼 모터 선형 매핑 적용 (Isaac Sim 0.0~-0.02 -> 하드웨어 6.15~7.6 rad)
+      float sim_gripper = ext_target_pos[6]; 
+      float normalized_g = (sim_gripper - 0.0f) / (-0.02f - 0.0f);
+      if (normalized_g < 0.0f) normalized_g = 0.0f;
+      if (normalized_g > 1.0f) normalized_g = 1.0f;
+      float calibrated_gripper_pos = 6.15f + normalized_g * (7.6f - 6.15f);
+
+      // 그리퍼 CAN 메시지 전송
+      operationControl(GRIPPER_CAN_ID, feed_forward_torque, calibrated_gripper_pos, target_vel, kp, kd);
+
+    } else {
+      // 왓치독 트립 발생 시 모터 안전 종료
+      if (ext_control_active) {
+        Serial.println("[EMERGENCY] UDP Stream Timeout! Disabling all motors for safety.");
+        ext_control_active = false;
+        for (int i = 0; i < 6; i++) {
+          disableMotor(JOINT_CAN_IDS[i]);
+        }
+        disableMotor(GRIPPER_CAN_ID);
+      }
+    }
+  }
+}
+
+// 시리얼 모니터 명령 창을 이용한 전체 모터 수동 긴급 제어
+void serialEvent() {
+  if (Serial.available()) {
+    char ch = Serial.read();
+    if (ch == 'd' || ch == 'D') {
+      for (int i = 0; i < 6; i++) { disableMotor(JOINT_CAN_IDS[i]); delay(10); }
+      disableMotor(GRIPPER_CAN_ID);
+    } else if (ch == 'e' || ch == 'E') {
+      for (int i = 0; i < 6; i++) { enableMotor(JOINT_CAN_IDS[i]); delay(10); }
+      enableMotor(GRIPPER_CAN_ID);
+    }
+  }
+}
