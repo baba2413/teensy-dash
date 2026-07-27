@@ -5,15 +5,15 @@
 // -------------------------------------------------------------
 // 1. 모터 및 통신 설정 파라미터
 // -------------------------------------------------------------
-const uint8_t ACT_ID_1 = 11;
-const uint8_t ACT_ID_2 = 1;       // 모터 CAN ID
+const uint8_t ACT_ID_1 = 1;   // 슬레이브 모터 (따라 움직이는 모터)
+const uint8_t ACT_ID_2 = 127;     // 마스터 모터 (사람이 손으로 움직이는 모터)
 const uint8_t HOST_ID = 253;    // Teensy(호스트) ID
 
-// Teensy 4.0/4.1의 CAN1 핀을 사용하면 Can0 인스턴스를 사용합니다.
+// Teensy 4.0/4.1의 CAN1 핀 사용
 FlexCAN_T4<CAN1, RX_SIZE_256, TX_SIZE_16> Can0;
 
 // -------------------------------------------------------------
-// 2. Robstride 프로토콜 물리적 제한 한계값 (데이터 정수화용)
+// 2. Robstride 프로토콜 물리적 제한 한계값
 // -------------------------------------------------------------
 const float P_MIN = -12.5f;
 const float P_MAX = 12.5f;
@@ -25,18 +25,13 @@ const float T_MIN = -18.0f;
 const float T_MAX = 18.0f;
 
 // -------------------------------------------------------------
-// 3. 제어 주기 및 타겟 프로파일 (50 Hz / dt = 0.02초)
+// 3. 제어 주기 설정 (텔레오퍼레이션용 500 Hz / dt = 0.002초)
 // -------------------------------------------------------------
-const float OPEN_POS = 6.15f;
-const float CLOSE_POS = 7.6f;
-const float CENTER = (OPEN_POS + CLOSE_POS) / 2.0f;
-const float AMPLITUDE = (CLOSE_POS - OPEN_POS) / 2.0f;
-const float FREQ = 0.2f; 
-
-const uint32_t CONTROL_PERIOD_US = 20000; // dt = 0.02s -> 20,000us
+const uint32_t CONTROL_PERIOD_US = 2000; // dt = 0.002s (2,000us = 500Hz)
 elapsedMicros controlTimer;
 
-float t_start = 0.0f;
+// 마스터 모터(ID 1)의 현재 위치를 실시간 저장하는 전역 변수
+volatile float master_pos = 0.0f;
 
 // -------------------------------------------------------------
 // 4. 데이터 스케일링 및 가상 시리얼 변환 헬퍼 함수
@@ -51,7 +46,6 @@ float uintToFloat(uint16_t x, float x_min, float x_max) {
   return x_min + (float)x * (x_max - x_min) / 65535.0f;
 }
 
-// CAN 메시지를 파이썬 시리얼 패킷 형태(17바이트 16진수)로 변환하여 출력하는 함수
 void printAsSerialPacket(const CAN_message_t &msg, const char* prefix) {
   uint32_t header_shifted = (msg.id << 3) | 4;
   
@@ -70,49 +64,37 @@ void printAsSerialPacket(const CAN_message_t &msg, const char* prefix) {
 // 5. Robstride CAN 송신 제어 함수군
 // -------------------------------------------------------------
 
-// 모터 활성화 (Type3Message 매칭)
+// 모터 활성화
 void enableMotor(uint8_t motor_id) {
-  // 1. 먼저 구동 모드(Run Mode, 레지스터 0x7005)를 '운전 제어 모드(0)'로 강제 세팅합니다.
   CAN_message_t mode_msg;
   mode_msg.flags.extended = 1;
-  mode_msg.id = (0x12 << 24) | (HOST_ID << 8) | motor_id; // Type 18 Write Parameter
+  mode_msg.id = (0x12 << 24) | (HOST_ID << 8) | motor_id;
   mode_msg.len = 8;
   
-  // 레지스터 주소 0x7005 -> Big-endian 스왑 적용하여 배치
   mode_msg.buf[0] = 0x05; 
   mode_msg.buf[1] = 0x70; 
   mode_msg.buf[2] = 0x00;
   mode_msg.buf[3] = 0x00;
-  
-  // 설정값: 0 (Control Mode / MIT)
   mode_msg.buf[4] = 0x00; 
   mode_msg.buf[5] = 0x00;
   mode_msg.buf[6] = 0x00;
   mode_msg.buf[7] = 0x00;
   
   Can0.write(mode_msg);
-  printAsSerialPacket(mode_msg, "TX_SET_MODE");
-
-  // 모터 내부 프로세서가 모드 전환 연산을 처리할 시간을 아주 잠깐(50ms) 줍니다.
   delay(50); 
 
-  // 2. 이제 세팅이 끝났으므로, 모터 전원을 켭니다 (Mode 3 Enable)
   CAN_message_t enable_msg;
   enable_msg.flags.extended = 1;
-  enable_msg.id = (3 << 24) | (HOST_ID << 8) | motor_id; // Mode 3 Enable
+  enable_msg.id = (3 << 24) | (HOST_ID << 8) | motor_id;
   enable_msg.len = 8;
   for (int i = 0; i < 8; i++) enable_msg.buf[i] = 0;
   
   Can0.write(enable_msg);
 
-  char prefix_enable[20];
-  sprintf(prefix_enable, "ENABLE_%d", motor_id);
-  printAsSerialPacket(enable_msg, prefix_enable);
-
   Serial.printf("[Teensy] Motor %d Initialized & Enabled successfully!\r\n", motor_id);
 }
 
-// 모터 비활성화 (Type4Message 매칭)
+// 모터 비활성화
 void disableMotor(uint8_t motor_id) {
   CAN_message_t msg;
   msg.flags.extended = 1;
@@ -121,13 +103,9 @@ void disableMotor(uint8_t motor_id) {
   for (int i = 0; i < 8; i++) msg.buf[i] = 0;
   
   Can0.write(msg);
-
-  char prefix_disable[20];
-  sprintf(prefix_disable, "DISABLE_%d", motor_id);
-  printAsSerialPacket(msg, prefix_disable);
 }
 
-// 실시간 운전 제어 (Type1Message / operation_control 매칭)
+// 실시간 운전 제어
 CAN_message_t operationControl(uint8_t motor_id, float feed_forward, float pos, float vel, float kp, float kd) {
   uint16_t p_int  = floatToUint(pos,          P_MIN, P_MAX,  16);
   uint16_t v_int  = floatToUint(vel,          V_MIN, V_MAX,  16);
@@ -155,23 +133,20 @@ CAN_message_t operationControl(uint8_t motor_id, float feed_forward, float pos, 
 }
 
 // -------------------------------------------------------------
-// 6. CAN 수신 인터럽트 콜백 (모터 피드백 파싱)
+// 6. CAN 수신 인터럽트 콜백 (마스터 모터 위치 수신)
 // -------------------------------------------------------------
 void rxCallback(const CAN_message_t &msg) {
   uint8_t mode = (msg.id >> 24) & 0x1F;
   
-  if (mode == 2) {
-    uint8_t motor_id = msg.id & 0xFF;
-    uint16_t p_raw = (msg.buf[0] << 8) | msg.buf[1];
-    uint16_t v_raw = (msg.buf[2] << 8) | msg.buf[3];
-    uint16_t t_raw = (msg.buf[4] << 8) | msg.buf[5];
+  if (mode == 2) { // 모터 상태 피드백 메시지
+    // [수정] 모터 ID는 Bit 8~15에 위치합니다.
+    uint8_t motor_id = (msg.id >> 8) & 0xFF; 
     
-    float current_pos = uintToFloat(p_raw, P_MIN, P_MAX);
-    float current_vel = uintToFloat(v_raw, V_MIN, V_MAX);
-    float current_trq = uintToFloat(t_raw, T_MIN, T_MAX);
-    
-    // Serial.printf("[RX Motor %d Feedback] Pos: %.3f rad, Vel: %.2f rad/s, Trq: %.2f Nm\r\n", 
-    //                   motor_id, current_pos, current_vel, current_trq);
+    // 마스터 모터(ID 1)의 피드백인 경우 위치 업데이트
+    if (motor_id == ACT_ID_2) {
+      uint16_t p_raw = (msg.buf[0] << 8) | msg.buf[1];
+      master_pos = uintToFloat(p_raw, P_MIN, P_MAX);
+    }
   }
 }
 
@@ -182,7 +157,7 @@ void setup() {
   Serial.begin(115200);
   while (!Serial && millis() < 3000); 
 
-  Serial.println("=== Robstride 1:1 CAN Loop Test (Dual Dynamic Debug) ===");
+  Serial.println("=== Robstride Teleoperation (Master ID 1 -> Slave ID 127) ===");
 
   Can0.begin();
   Can0.setBaudRate(1000000); // 1 Mbps
@@ -195,53 +170,38 @@ void setup() {
   Serial.println("Teensy CAN initialized.");
   delay(1000);
 
+  // 마스터(ID 1) 및 슬레이브(ID 127) 모터 모두 활성화
+  enableMotor(ACT_ID_2); // ID 1
+  delay(100);
+  enableMotor(ACT_ID_1); // ID 127
 
-  // enableMotor();
-
-  
-  t_start = (float)micros() * 1e-6f;
   controlTimer = 0;
 }
 
 void loop() {
-  Can0.events(); 
+  Can0.events(); // CAN 수신 이벤트 처리
 
-  // 20ms 주기 제어 루프 (50Hz)
+  // 2ms 주기 제어 루프 (500Hz)
   if (controlTimer >= CONTROL_PERIOD_US) {
     controlTimer -= CONTROL_PERIOD_US;
 
-    float t = ((float)micros() * 1e-6f) - t_start;
+    // 1. 마스터 모터(ID 1) : Kp=0, Kd=0 으로 설정해 손으로 자유롭게 돌릴 수 있게 함
+    // (이 패킷을 전송해야 마스터 모터가 위치 피드백 응답 패킷을 보냅니다)
+    operationControl(ACT_ID_2, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
 
-    float target_pos_1 = CENTER + AMPLITUDE * cosf(2.0f * M_PI * FREQ * t + M_PI);
-    float target_pos_2 = CENTER - AMPLITUDE * cosf(2.0f * M_PI * FREQ * t + M_PI);
-    float target_vel = 0.0f; 
-    float feed_forward_torque = 0.0f;
-    
-    float kp = 10.0f; 
-    float kd = 1.0f;  
+    // 2. 슬레이브 모터(ID 127) : 마스터의 현재 위치(master_pos)로 추종 명령 전송
+    float slave_kp = 25.0f; // 슬레이브 추종 강도 (상황에 따라 10.0 ~ 50.0 조절)
+    float slave_kd = 1.0f;  // 감쇠 계수
+    CAN_message_t msg_slave = operationControl(ACT_ID_1, 0.0f, master_pos, 0.0f, slave_kp, slave_kd);
 
-    CAN_message_t msg_1 = operationControl(ACT_ID_1, feed_forward_torque, target_pos_1, target_vel, kp, kd);
-    CAN_message_t msg_2 = operationControl(ACT_ID_2, feed_forward_torque, target_pos_2, target_vel, kp, kd);
-
+    // 500ms마다 시리얼 모니터에 상태 출력
     static uint32_t lastPrint = 0;
     if (millis() - lastPrint >= 500) {
       lastPrint = millis();
       
-      // 모터 1 모니터링 (ID 127)
-      Serial.printf("[M1 TARGET (ID %d)] Pos: %.3f rad, Vel: %.2f rad/s, Kp: %.1f, Kd: %.1f\r\n", 
-                    ACT_ID_1, target_pos_1, target_vel, kp, kd);
-      printAsSerialPacket(msg_1, "M1_HEX_STR");
-      
-      // 모터 2 모니터링 (ID 1)
-      Serial.printf("[M2 TARGET (ID %d)] Pos: %.3f rad, Vel: %.2f rad/s, Kp: %.1f, Kd: %.1f\r\n", 
-                    ACT_ID_2, target_pos_2, target_vel, kp, kd);
-      printAsSerialPacket(msg_2, "M2_HEX_STR");
-      
-      Serial.println(); // 구분용 빈 줄
+      Serial.printf("[TELEOP] Master(ID %d) Pos: %.3f rad  -->  Slave(ID %d) Target Pos: %.3f rad\r\n", 
+                    ACT_ID_2, master_pos, ACT_ID_1, master_pos);
     }
-
-
-
   }
 }
 
@@ -250,12 +210,14 @@ void serialEvent() {
     char ch = Serial.read();
     if (ch == 'd' || ch == 'D') {
       disableMotor(ACT_ID_1);
-      delay(100); // CAN 버스 통신 충돌 방지를 위한 미세 딜레이
-      disableMotor(ACT_ID_2);
-    } else if (ch == 'e' || ch == 'E') {
-      enableMotor(ACT_ID_1);
       delay(100);
+      disableMotor(ACT_ID_2);
+      Serial.println("[Teensy] Motors Disabled.");
+    } else if (ch == 'e' || ch == 'E') {
       enableMotor(ACT_ID_2);
+      delay(100);
+      enableMotor(ACT_ID_1);
+      Serial.println("[Teensy] Motors Enabled.");
     }
   }
 }
