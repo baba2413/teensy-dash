@@ -5,9 +5,9 @@
 // -------------------------------------------------------------
 // 1. 모터 및 통신 설정 파라미터
 // -------------------------------------------------------------
-const uint8_t ACT_ID_1 = 1;   // 슬레이브 모터 (따라 움직이는 모터)
-const uint8_t ACT_ID_2 = 127;     // 마스터 모터 (사람이 손으로 움직이는 모터)
-const uint8_t HOST_ID = 253;    // Teensy(호스트) ID
+const uint8_t ACT_ID_1 = 1;      // 슬레이브 모터 (따라 움직이는 모터)
+const uint8_t ACT_ID_2 = 127;    // 마스터 모터 (사람이 손으로 움직이는 모터)
+const uint8_t HOST_ID = 253;     // Teensy(호스트) ID
 
 // Teensy 4.0/4.1의 CAN1 핀 사용
 FlexCAN_T4<CAN1, RX_SIZE_256, TX_SIZE_16> Can0;
@@ -30,11 +30,17 @@ const float T_MAX = 18.0f;
 const uint32_t CONTROL_PERIOD_US = 2000; // dt = 0.002s (2,000us = 500Hz)
 elapsedMicros controlTimer;
 
-// 마스터 모터(ID 1)의 현재 위치를 실시간 저장하는 전역 변수
+// -------------------------------------------------------------
+// 4. 실시간 상태 및 오프셋 변수
+// -------------------------------------------------------------
 volatile float master_pos = 0.0f;
+volatile float slave_pos = 0.0f;
+volatile float slave_trq = 0.0f; // 슬레이브 실시간 토크 피드백
+
+float pos_offset = 0.0f; // 초기 마스터-슬레이브 각도 차이 (오프셋)
 
 // -------------------------------------------------------------
-// 4. 데이터 스케일링 및 가상 시리얼 변환 헬퍼 함수
+// 5. 데이터 스케일링 헬퍼 함수
 // -------------------------------------------------------------
 uint16_t floatToUint(float x, float x_min, float x_max, uint8_t bits) {
   if (x < x_min) x = x_min;
@@ -46,22 +52,8 @@ float uintToFloat(uint16_t x, float x_min, float x_max) {
   return x_min + (float)x * (x_max - x_min) / 65535.0f;
 }
 
-void printAsSerialPacket(const CAN_message_t &msg, const char* prefix) {
-  uint32_t header_shifted = (msg.id << 3) | 4;
-  
-  uint8_t h0 = (header_shifted >> 24) & 0xFF;
-  uint8_t h1 = (header_shifted >> 16) & 0xFF;
-  uint8_t h2 = (header_shifted >> 8) & 0xFF;
-  uint8_t h3 = header_shifted & 0xFF;
-
-  Serial.printf("[%s] 41 54 %02X %02X %02X %02X 08 %02X %02X %02X %02X %02X %02X %02X %02X 0D 0A\r\n",
-                prefix, h0, h1, h2, h3,
-                msg.buf[0], msg.buf[1], msg.buf[2], msg.buf[3],
-                msg.buf[4], msg.buf[5], msg.buf[6], msg.buf[7]);
-}
-
 // -------------------------------------------------------------
-// 5. Robstride CAN 송신 제어 함수군
+// 6. Robstride CAN 송신 제어 함수군
 // -------------------------------------------------------------
 
 // 모터 활성화
@@ -133,31 +125,54 @@ CAN_message_t operationControl(uint8_t motor_id, float feed_forward, float pos, 
 }
 
 // -------------------------------------------------------------
-// 6. CAN 수신 인터럽트 콜백 (마스터 모터 위치 수신)
+// 7. CAN 수신 인터럽트 콜백
 // -------------------------------------------------------------
 void rxCallback(const CAN_message_t &msg) {
   uint8_t mode = (msg.id >> 24) & 0x1F;
   
-  if (mode == 2) { // 모터 상태 피드백 메시지
-    // [수정] 모터 ID는 Bit 8~15에 위치합니다.
+  if (mode == 2) {
     uint8_t motor_id = (msg.id >> 8) & 0xFF; 
-    
-    // 마스터 모터(ID 1)의 피드백인 경우 위치 업데이트
-    if (motor_id == ACT_ID_2) {
-      uint16_t p_raw = (msg.buf[0] << 8) | msg.buf[1];
+    uint16_t p_raw = (msg.buf[0] << 8) | msg.buf[1];
+    uint16_t t_raw = (msg.buf[4] << 8) | msg.buf[5]; // 토크 Raw 데이터
+
+    if (motor_id == ACT_ID_2) {       // 마스터(ID 127)
       master_pos = uintToFloat(p_raw, P_MIN, P_MAX);
+    } 
+    else if (motor_id == ACT_ID_1) {  // 슬레이브(ID 1)
+      slave_pos = uintToFloat(p_raw, P_MIN, P_MAX);
+      slave_trq = uintToFloat(t_raw, T_MIN, T_MAX); // 슬레이브 토크 읽기
     }
   }
 }
 
 // -------------------------------------------------------------
-// 7. 메인 루프 구조
+// 8. 초기 위치 오프셋 측정 헬퍼 함수
+// -------------------------------------------------------------
+void setupOffset() {
+  // 모터 피드백 유도를 위한 Dummy 명령 전송
+  operationControl(ACT_ID_2, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
+  operationControl(ACT_ID_1, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
+  
+  // 피드백 데이터 수신 대기 (100ms)
+  uint32_t waitStart = millis();
+  while (millis() - waitStart < 100) {
+    Can0.events();
+  }
+
+  // 초기 오프셋 계산 (pos_offset = slave - master)
+  pos_offset = slave_pos - master_pos;
+  Serial.printf("[SETUP] Initial Offset Calculated: %.3f rad (Master: %.3f, Slave: %.3f)\r\n", 
+                pos_offset, master_pos, slave_pos);
+}
+
+// -------------------------------------------------------------
+// 9. 메인 루프 구조
 // -------------------------------------------------------------
 void setup() {
   Serial.begin(115200);
   while (!Serial && millis() < 3000); 
 
-  Serial.println("=== Robstride Teleoperation (Master ID 1 -> Slave ID 127) ===");
+  Serial.println("=== Robstride Teleoperation (Position-Torque with Initial Offset) ===");
 
   Can0.begin();
   Can0.setBaudRate(1000000); // 1 Mbps
@@ -170,10 +185,13 @@ void setup() {
   Serial.println("Teensy CAN initialized.");
   delay(1000);
 
-  // 마스터(ID 1) 및 슬레이브(ID 127) 모터 모두 활성화
-  enableMotor(ACT_ID_2); // ID 1
+  // 마스터(ID 127) 및 슬레이브(ID 1) 모터 모두 활성화
+  enableMotor(ACT_ID_2); // ID 127
   delay(100);
-  enableMotor(ACT_ID_1); // ID 127
+  enableMotor(ACT_ID_1); // ID 1
+
+  // 초기 위치 오프셋 계산 실행
+  setupOffset();
 
   controlTimer = 0;
 }
@@ -185,22 +203,34 @@ void loop() {
   if (controlTimer >= CONTROL_PERIOD_US) {
     controlTimer -= CONTROL_PERIOD_US;
 
-    // 1. 마스터 모터(ID 1) : Kp=0, Kd=0 으로 설정해 손으로 자유롭게 돌릴 수 있게 함
-    // (이 패킷을 전송해야 마스터 모터가 위치 피드백 응답 패킷을 보냅니다)
-    operationControl(ACT_ID_2, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
+    // 1. 슬레이브 모터(ID 1) : 오프셋이 적용된 마스터 위치 추종
+    float slave_target_pos = master_pos + pos_offset;
+    float slave_kp = 25.0f; // 슬레이브 위치 추종 강도
+    float slave_kd = 1.0f;
+    operationControl(ACT_ID_1, 0.0f, slave_target_pos, 0.0f, slave_kp, slave_kd);
 
-    // 2. 슬레이브 모터(ID 127) : 마스터의 현재 위치(master_pos)로 추종 명령 전송
-    float slave_kp = 25.0f; // 슬레이브 추종 강도 (상황에 따라 10.0 ~ 50.0 조절)
-    float slave_kd = 1.0f;  // 감쇠 계수
-    CAN_message_t msg_slave = operationControl(ACT_ID_1, 0.0f, master_pos, 0.0f, slave_kp, slave_kd);
+    // 2. 마스터 모터(ID 127) : 위치 저항(Kp=0)은 끄고, 슬레이브의 토크만 손으로 반력 피드백
+    // (슬레이브 토크 반대 방향으로 피드백 토크 설정, 스케일 0.5f 적용)
+    float filtered_trq = slave_trq;
+    if (fabsf(filtered_trq) < 0.15f) {
+      filtered_trq = 0.0f;
+    } else if (filtered_trq > 0) {
+      filtered_trq -= 0.15f;
+    } else {
+      filtered_trq += 0.15f;
+    }
 
-    // 500ms마다 시리얼 모니터에 상태 출력
+    float feedback_torque = -1.0f * filtered_trq * 0.5f;
+    float master_kd = 0.0f; // 최소한의 손떨림 방지 댐핑만 유지
+    operationControl(ACT_ID_2, feedback_torque, 0.0f, 0.0f, 0.0f, master_kd);
+
+    // 500ms마다 상태 모니터링 출력
     static uint32_t lastPrint = 0;
     if (millis() - lastPrint >= 500) {
       lastPrint = millis();
       
-      Serial.printf("[TELEOP] Master(ID %d) Pos: %.3f rad  -->  Slave(ID %d) Target Pos: %.3f rad\r\n", 
-                    ACT_ID_2, master_pos, ACT_ID_1, master_pos);
+      Serial.printf("[P-T TELEOP] Master Pos: %.3f rad | Slave Pos: %.3f rad (Target: %.3f) | Slave Trq: %.2f Nm | FB Trq: %.2f Nm\r\n", 
+                    master_pos, slave_pos, slave_target_pos, slave_trq, feedback_torque);
     }
   }
 }
@@ -217,7 +247,8 @@ void serialEvent() {
       enableMotor(ACT_ID_2);
       delay(100);
       enableMotor(ACT_ID_1);
-      Serial.println("[Teensy] Motors Enabled.");
+      setupOffset(); // 재활성화 시 오프셋 재계산
+      Serial.println("[Teensy] Motors Enabled & Offset Reset.");
     }
   }
 }
